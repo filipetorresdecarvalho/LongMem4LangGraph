@@ -1,0 +1,18 @@
+# LongMem4LangGraph
+
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+.env
+.venv/
+venv/
+__pypackages__/
+.DS_Store
+*~
