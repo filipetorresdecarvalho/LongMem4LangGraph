@@ -3,30 +3,43 @@
 Gives LangGraph agents access to the complete history of what
 previous agents said — not just the current state.
 
+Implements the MemoryStore ABC interface for extensibility.
+Users can create custom backends by implementing MemoryStore.
+
 In AGNO, agents have session.memory that persists across turns.
 This module replicates that behavior with SQLite persistence,
 so every agent call can read what came before.
 
+Supports pluggable search backends:
+- Default: SqliteLikeSearch (zero dependencies, LIKE-based)
+- Optional: WeaviateSearch (semantic vector search via Weaviate)
+
 Usage:
     from longmem4langgraph import HistoryStore
+    from longmem4langgraph.search import WeaviateSearch
 
     history = HistoryStore("pipeline.db")
 
-    def my_agent(state):
-        # Read what previous agents wrote
-        context = history.get_context(state["request_id"], last_n=10)
+    # With semantic search
+    history = HistoryStore("pipeline.db",
+                           search_backend=WeaviateSearch())
 
-        # Write what this agent did
-        history.add(state["request_id"], "agent3", result)
-        ...
+    def my_agent(state):
+        context = history.get_context(state["request_id"], last_n=10)
+        history.add_turn(state["request_id"], "agent3", result)
 """
 
 import json
+import logging
 import threading
 from datetime import datetime, timezone
 from typing import List, Optional
 
 from .connection import SqliteConnection
+from .migration import ensure_migrated
+from .search import SqliteLikeSearch, SearchBackend
+
+logger = logging.getLogger(__name__)
 
 
 def _validate_non_empty(value, name: str) -> None:
@@ -42,53 +55,38 @@ def _validate_positive_int(value, name: str) -> None:
 class HistoryStore:
     """AGNO-style conversation memory backed by SQLite.
 
-    Each 'turn' in the conversation is stored with source, content,
-    content_type, and metadata. Agents can query the full history
-    as a formatted string for prompt injection.
+    Implements the MemoryStore ABC interface. Each 'turn' in the
+    conversation is stored with source, content, content_type, and
+    metadata. Agents can query the full history as a formatted
+    string for prompt injection.
+
+    Supports pluggable search backends for semantic or keyword search.
+    Defaults to SqliteLikeSearch (zero dependencies).
 
     Args:
         db_path: Path to SQLite file. Can share with SqliteSaver.
         connection: Optional shared SqliteConnection (avoids multiple connections).
+        search_backend: Optional SearchBackend for semantic search.
+            Defaults to SqliteLikeSearch (LIKE-based, zero deps).
+            Pass WeaviateSearch() for semantic vector search.
     """
 
-    def __init__(self, db_path: str = None, connection: SqliteConnection = None):
+    def __init__(
+        self,
+        db_path: str = None,
+        connection: SqliteConnection = None,
+        search_backend: SearchBackend = None,
+    ):
         if connection:
             self._conn = connection
         else:
             self._conn = SqliteConnection(db_path or "pipeline.db")
+
         self._lock = threading.Lock()
-        self._init_db()
+        self._search_backend = search_backend or SqliteLikeSearch(self._conn)
+        ensure_migrated(self._conn)
 
-    def _init_db(self) -> None:
-        """Create history tables."""
-        self._conn.executescript("""
-            CREATE TABLE IF NOT EXISTS agent_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                request_id TEXT NOT NULL,
-                thread_id TEXT,
-                turn_number INTEGER NOT NULL,
-                source TEXT NOT NULL,
-                content_type TEXT NOT NULL DEFAULT 'text',
-                content TEXT NOT NULL,
-                summary TEXT,
-                metadata TEXT DEFAULT '{}',
-                token_count INTEGER,
-                cost_cents REAL DEFAULT 0.0,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_history_request
-                ON agent_history(request_id, turn_number);
-
-            CREATE INDEX IF NOT EXISTS idx_history_thread
-                ON agent_history(thread_id, turn_number);
-
-            CREATE INDEX IF NOT EXISTS idx_history_source
-                ON agent_history(request_id, source);
-        """)
-        self._conn.commit()
-
-    def add(
+    def add_turn(
         self,
         request_id: str,
         source: str,
@@ -102,6 +100,9 @@ class HistoryStore:
     ) -> int:
         """Add a conversation turn (like AGNO's session.memory).
 
+        Also indexes the content in the configured search backend
+        (non-fatal if indexing fails).
+
         Args:
             request_id: Pipeline/request identifier.
             source: Who wrote this (agent1, agent2, user, system, etc.).
@@ -109,6 +110,9 @@ class HistoryStore:
             content_type: text, json, code, error, decision, etc.
             summary: Short summary for context when full content is too long.
             metadata: Extra structured data (key used, model, duration, etc.).
+            thread_id: Optional thread identifier for cross-thread queries.
+            token_count: LLM token count for cost tracking.
+            cost_cents: Cost in cents for cost tracking.
 
         Returns:
             The turn number (1-indexed).
@@ -117,8 +121,6 @@ class HistoryStore:
         _validate_non_empty(source, "source")
 
         with self._lock:
-            # Atomic: INSERT using COALESCE for auto-incrementing turn_number
-            # This avoids the race condition of SELECT-then-INSERT
             self._conn.execute(
                 """INSERT INTO agent_history
                    (request_id, thread_id, turn_number, source,
@@ -142,13 +144,47 @@ class HistoryStore:
             )
             self._conn.commit()
 
-            # Return the turn number that was just inserted
             turn = self._conn.execute(
                 "SELECT MAX(turn_number) FROM agent_history WHERE request_id = ?",
                 (request_id,),
             ).fetchone()[0]
 
+        if self._search_backend:
+            try:
+                self._search_backend.index(
+                    request_id, source, content,
+                    turn_number=turn,
+                    content_type=content_type,
+                    metadata=metadata,
+                    thread_id=thread_id,
+                )
+            except Exception as e:
+                logger.debug("Search backend index failed (non-fatal): %s", e)
+
         return turn
+
+    def add(
+        self,
+        request_id: str,
+        source: str,
+        content: str,
+        content_type: str = "text",
+        summary: Optional[str] = None,
+        metadata: Optional[dict] = None,
+        thread_id: Optional[str] = None,
+        token_count: Optional[int] = None,
+        cost_cents: float = 0.0,
+    ) -> int:
+        """Alias for add_turn() — preserved for backward compatibility."""
+        return self.add_turn(
+            request_id, source, content,
+            content_type=content_type,
+            summary=summary,
+            metadata=metadata,
+            thread_id=thread_id,
+            token_count=token_count,
+            cost_cents=cost_cents,
+        )
 
     def get_history(
         self,
@@ -170,7 +206,7 @@ class HistoryStore:
         _validate_positive_int(last_n, "last_n")
 
         query = "SELECT * FROM agent_history WHERE request_id = ?"
-        params = [request_id]
+        params: list = [request_id]
 
         if source_filter:
             placeholders = ",".join("?" for _ in source_filter)
@@ -231,6 +267,40 @@ class HistoryStore:
 
         return "\n\n".join(parts)
 
+    def search(self, request_id: str, query_text: str, limit: int = 10) -> List[dict]:
+        """Search conversation history.
+
+        Uses the configured search backend (WeaviateSearch for semantic,
+        SqliteLikeSearch for keyword). Falls back to LIKE if the
+        backend returns no results or fails.
+
+        Args:
+            request_id: The pipeline to search within.
+            query_text: The search query.
+            limit: Maximum results to return.
+
+        Returns:
+            List of matching history entries.
+        """
+        _validate_non_empty(request_id, "request_id")
+
+        if self._search_backend:
+            try:
+                results = self._search_backend.search(query_text, request_id, limit)
+                if results:
+                    return results
+            except Exception as e:
+                logger.debug("Search backend failed, falling back to LIKE: %s", e)
+
+        safe_query = query_text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        rows = self._conn.execute(
+            """SELECT * FROM agent_history
+               WHERE request_id = ? AND content LIKE ?
+               ORDER BY turn_number""",
+            (request_id, f"%{safe_query}%"),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def count_turns(self, request_id: str) -> int:
         """Count total turns for a request."""
         _validate_non_empty(request_id, "request_id")
@@ -257,25 +327,3 @@ class HistoryStore:
             (request_id,),
         ).fetchone()
         return dict(row)
-
-    def search(self, request_id: str, query_text: str) -> List[dict]:
-        """Basic text search over history content.
-
-        For production, use Weaviate or other vector search.
-        This is a simple LIKE-based search for quick debugging.
-
-        Note: Special LIKE characters (% and _) are escaped to prevent
-        unintended wildcard matching.
-        """
-        _validate_non_empty(request_id, "request_id")
-
-        # Escape % and _ for SQLite LIKE — prevents wildcard injection
-        safe_query = query_text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-        rows = self._conn.execute(
-            """SELECT * FROM agent_history
-               WHERE request_id = ? AND content LIKE ?
-               ORDER BY turn_number""",
-            (request_id, f"%{safe_query}%"),
-        ).fetchall()
-        return [dict(r) for r in rows]

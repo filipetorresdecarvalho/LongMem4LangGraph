@@ -3,6 +3,9 @@
 This is the core persistence layer — it replaces LangGraph's default
 in-memory checkpointer with a SQLite-backed one that survives restarts.
 
+Implements the CheckpointStore ABC interface for extensibility.
+Users can create custom backends by implementing CheckpointStore.
+
 What it stores:
     - Full graph state at each checkpoint step
     - Thread/run metadata for multi-session support
@@ -10,6 +13,11 @@ What it stores:
 
 Can accept a shared SqliteConnection to avoid multiple connections
 to the same database file.
+
+Usage:
+    from longmem4langgraph import SqliteSaver
+
+    graph = builder.compile(checkpointer=SqliteSaver("state.db"))
 """
 
 import json
@@ -26,6 +34,7 @@ from langgraph.checkpoint.base import (
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from .connection import SqliteConnection
+from .migration import ensure_migrated
 
 
 class SqliteSaver(BaseCheckpointSaver):
@@ -36,6 +45,10 @@ class SqliteSaver(BaseCheckpointSaver):
 
         from longmem4langgraph import SqliteSaver
         graph = builder.compile(checkpointer=SqliteSaver("state.db"))
+
+    Implements the CheckpointStore ABC interface. Users who want a
+    different database backend (PostgreSQL, MySQL, etc.) should
+    implement CheckpointStore instead of subclassing this class.
 
     Use with a shared connection to avoid write contention:
 
@@ -63,53 +76,7 @@ class SqliteSaver(BaseCheckpointSaver):
             self._conn = SqliteConnection(db_path or "pipeline.db")
 
         self._lock = threading.Lock()
-        self._init_db()
-
-    def _init_db(self) -> None:
-        """Create checkpoint tables if they don't exist."""
-        self._conn.executescript("""
-            CREATE TABLE IF NOT EXISTS checkpoint_writes (
-                thread_id TEXT NOT NULL,
-                checkpoint_ns TEXT NOT NULL DEFAULT '',
-                checkpoint_id TEXT NOT NULL,
-                task_id TEXT NOT NULL,
-                idx INTEGER NOT NULL,
-                channel TEXT NOT NULL,
-                type TEXT,
-                value BLOB,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx)
-            );
-
-            CREATE TABLE IF NOT EXISTS checkpoint_blobs (
-                thread_id TEXT NOT NULL,
-                checkpoint_ns TEXT NOT NULL DEFAULT '',
-                channel TEXT NOT NULL,
-                version TEXT NOT NULL,
-                type TEXT,
-                value BLOB,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                PRIMARY KEY (thread_id, checkpoint_ns, channel, version)
-            );
-
-            CREATE TABLE IF NOT EXISTS checkpoints (
-                thread_id TEXT NOT NULL,
-                checkpoint_ns TEXT NOT NULL DEFAULT '',
-                checkpoint_id TEXT NOT NULL,
-                parent_checkpoint_id TEXT,
-                type TEXT,
-                checkpoint JSONB NOT NULL,
-                metadata JSONB DEFAULT '{}',
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_checkpoints_thread
-                ON checkpoints(thread_id, checkpoint_ns, checkpoint_id);
-            CREATE INDEX IF NOT EXISTS idx_checkpoint_writes_thread
-                ON checkpoint_writes(thread_id, checkpoint_ns, checkpoint_id);
-        """)
-        self._conn.commit()
+        ensure_migrated(self._conn)
 
     # =====================================================================
     # Required BaseCheckpointSaver overrides
@@ -159,13 +126,16 @@ class SqliteSaver(BaseCheckpointSaver):
 
     def list(
         self,
-        config: dict,
+        config: Optional[dict] = None,
         *,
         filter: Optional[dict] = None,
         before: Optional[Any] = None,
         limit: Optional[int] = None,
     ) -> Iterator[CheckpointTuple]:
         """List checkpoints for a thread, optionally filtered."""
+        if config is None:
+            return iter([])
+
         thread_id = config["configurable"]["thread_id"]
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
 
@@ -217,6 +187,7 @@ class SqliteSaver(BaseCheckpointSaver):
         config: dict,
         checkpoint: Checkpoint,
         metadata: CheckpointMetadata,
+        new_versions: Any,
     ) -> dict:
         """Save a checkpoint. Called by LangGraph after each node execution."""
         thread_id = config["configurable"]["thread_id"]
@@ -226,6 +197,9 @@ class SqliteSaver(BaseCheckpointSaver):
         parent_id = None
         if config["configurable"].get("checkpoint_id"):
             parent_id = config["configurable"]["checkpoint_id"]
+
+        checkpoint_data = self._serialize_checkpoint(checkpoint)
+        metadata_data = self._serialize_metadata(metadata)
 
         with self._lock:
             self._conn.execute(
@@ -239,8 +213,8 @@ class SqliteSaver(BaseCheckpointSaver):
                     checkpoint_id,
                     parent_id,
                     checkpoint.get("type", ""),
-                    json.dumps(checkpoint),
-                    json.dumps(metadata),
+                    checkpoint_data,
+                    metadata_data,
                 ),
             )
             self._conn.commit()
@@ -258,6 +232,7 @@ class SqliteSaver(BaseCheckpointSaver):
         config: dict,
         writes: list,
         task_id: str,
+        task_path: str = "",
     ) -> None:
         """Store pending writes for a checkpoint (for async tasks)."""
         thread_id = config["configurable"]["thread_id"]
@@ -267,6 +242,7 @@ class SqliteSaver(BaseCheckpointSaver):
         with self._lock:
             for idx, write in enumerate(writes):
                 channel, value = write
+                type_str, value_bytes = self.serde.dumps_typed(value)
                 self._conn.execute(
                     """INSERT OR REPLACE INTO checkpoint_writes
                        (thread_id, checkpoint_ns, checkpoint_id,
@@ -279,27 +255,41 @@ class SqliteSaver(BaseCheckpointSaver):
                         task_id,
                         idx,
                         channel,
-                        self.SERIALIZER.typetuple(value),
-                        self.SERIALIZER.dumps(value),
+                        type_str,
+                        value_bytes,
                     ),
                 )
             self._conn.commit()
 
     # =====================================================================
-    # Serialization helpers
+    # Serialization helpers — uses serde for proper type handling
     # =====================================================================
 
-    def _deserialize_checkpoint(self, raw: str) -> dict:
-        if isinstance(raw, str):
-            return json.loads(raw)
-        return json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+    def _serialize_checkpoint(self, checkpoint: dict) -> bytes:
+        type_str, data = self.serde.dumps_typed(checkpoint)
+        return data
 
-    def _deserialize_metadata(self, raw: str) -> dict:
-        if not raw or raw == "{}":
+    def _deserialize_checkpoint(self, raw: Any) -> dict:
+        if not raw:
             return {}
         if isinstance(raw, str):
-            return json.loads(raw)
-        return json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            raw = raw.encode()
+        if isinstance(raw, (bytes, memoryview)):
+            return self.serde.loads_typed(("msgpack", bytes(raw)))
+        return raw
+
+    def _serialize_metadata(self, metadata: dict) -> bytes:
+        type_str, data = self.serde.dumps_typed(metadata)
+        return data
+
+    def _deserialize_metadata(self, raw: Any) -> dict:
+        if not raw:
+            return {}
+        if isinstance(raw, str):
+            raw = raw.encode()
+        if isinstance(raw, (bytes, memoryview)):
+            return self.serde.loads_typed(("msgpack", bytes(raw)))
+        return raw
 
     # =====================================================================
     # Utility

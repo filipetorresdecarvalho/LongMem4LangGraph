@@ -1,11 +1,11 @@
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "longmem4langgraph"
-version = "0.1.0"
-description = "Long-term SQLite-backed memory for LangGraph — AGNO-style history, crash recovery, persistent checkpoints"
+version = "0.2.0"
+description = "Long-term memory for LangGraph — pluggable backends, AGNO-style history, crash recovery, semantic search"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
@@ -13,7 +13,8 @@ authors = [
 ]
 keywords = [
     "langgraph", "langchain", "sqlite", "memory", "persistence",
-    "checkpoint", "agno", "state-machine", "ai-agents"
+    "checkpoint", "agno", "state-machine", "ai-agents", "weaviate",
+    "vector-search", "semantic-search", "mcp",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -25,6 +26,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
 ]
 
 dependencies = [
@@ -37,11 +39,14 @@ dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
     "pytest-mock>=3.0",
+    "ruff>=0.4.0",
+    "mypy>=1.0",
 ]
 
 [project.urls]
 Homepage = "https://github.com/filipetorresdecarvalho/LongMem4LangGraph"
 Source = "https://github.com/filipetorresdecarvalho/LongMem4LangGraph"
+Issues = "https://github.com/filipetorresdecarvalho/LongMem4LangGraph/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

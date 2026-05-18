@@ -1,8 +1,8 @@
-"""StateManager — Combined state, history, and audit in one Singleton.
+"""StateManager — Combined state, history, and audit in one class.
 
-This is the 'everything in one place' class from the RTGo V5 design.
-It wraps SqliteSaver (checkpoints), HistoryStore (agent memory),
-recovery (crash recovery), and adds pipeline-level operations.
+Implements the PipelineStore ABC interface. Wraps SqliteSaver
+(checkpoints), HistoryStore (agent memory), and recovery (crash recovery)
+with pipeline-level operations.
 
 All components share a single SqliteConnection to avoid write
 contention and enable VACUUM.
@@ -10,121 +10,104 @@ contention and enable VACUUM.
 Use this when you want a single entry point for all persistence needs.
 Use the individual components (SqliteSaver, HistoryStore) when you
 want only specific functionality.
+
+Usage:
+    from longmem4langgraph import StateManager
+
+    with StateManager("pipeline.db") as sm:
+        sm.save_state("req-1", {"status": "processing"})
+        summary = sm.get_summary("req-1")
 """
 
 import json
+import logging
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, List, Dict
+from typing import Any, List, Optional
 
 from .connection import SqliteConnection
 from .saver import SqliteSaver
 from .history import HistoryStore
 from . import recovery
+from .migration import ensure_migrated
 
-# --- SQL Authorizer for read-only query mode ---
+logger = logging.getLogger(__name__)
+
 _SQLITE_OK = 0
 _SQLITE_DENY = 8
-
 _SQLITE_READ = 21
-_SQLITE_INSERT = 26
-_SQLITE_UPDATE = 23
-_SQLITE_DELETE = 9
-_SQLITE_ATTACH = 27
-_SQLITE_DETACH = 28
 _SQLITE_PRAGMA = 19
-_SQLITE_FUNCTION = 31
 
 
 def _read_only_authorizer(action_code, arg1, arg2, db_name, trigger_name):
-    """SQLite authorizer that only allows SELECT and PRAGMA (non-write)."""
+    """SQLite authorizer that blocks write operations.
+
+    Allows all read and pragma operations. Denies INSERT, UPDATE,
+    DELETE, DROP, ALTER, CREATE, ATTACH, and DETACH.
+    """
     if action_code == _SQLITE_READ:
         return _SQLITE_OK
     if action_code == _SQLITE_PRAGMA:
         return _SQLITE_OK
-    # Deny all write operations
     return _SQLITE_DENY
 
 
+_WRITE_KEYWORDS = frozenset([
+    "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE",
+    "REPLACE", "REINDEX", "ATTACH", "DETACH", "VACUUM",
+])
+
+
+def _is_read_only_query(sql: str) -> bool:
+    """Check if a SQL query is read-only by examining the first keyword."""
+    first_word = sql.strip().split()[0].upper() if sql.strip() else ""
+    return first_word not in _WRITE_KEYWORDS
+
+
 class StateManager:
-    """Singleton-ish SQLite-backed state manager.
+    """SQLite-backed state manager for persistent LangGraph pipelines.
 
     Provides everything needed for persistent LangGraph pipelines:
     - Checkpoint persistence (via SqliteSaver)
     - AGNO-style history (via HistoryStore)
     - Crash recovery (via recovery module)
-    - Pipeline summaries, audit, and queries
+    - Pipeline summaries, audit, and read-only queries
 
-    All sub-components share a single SqliteConnection.
+    Implements the PipelineStore ABC interface. All sub-components
+    share a single SqliteConnection.
 
     Args:
         db_path: Path to SQLite file. Use same path for all components.
+        search_backend: Optional SearchBackend for semantic search.
+            Passed through to HistoryStore.
     """
 
-    def __init__(self, db_path: str = "pipeline.db"):
+    def __init__(
+        self,
+        db_path: str = "pipeline.db",
+        search_backend=None,
+    ):
         self.db_path = str(Path(db_path).expanduser().resolve())
         self._conn = SqliteConnection(self.db_path)
 
-        # Sub-components sharing the SAME connection (no more 3-connection bug)
-        self.checkpointer = SqliteSaver(self.db_path, connection=self._conn)
-        self.history = HistoryStore(connection=self._conn)
+        self.checkpointer = SqliteSaver(
+            self.db_path, connection=self._conn,
+        )
+        self.history = HistoryStore(
+            connection=self._conn,
+            search_backend=search_backend,
+        )
 
         self._lock = threading.Lock()
-        self._init_db()
-
-    def _init_db(self) -> None:
-        """Extended tables for pipeline management."""
-        self._conn.executescript("""
-            CREATE TABLE IF NOT EXISTS pipeline_states (
-                request_id TEXT PRIMARY KEY,
-                thread_id TEXT,
-                status TEXT NOT NULL DEFAULT 'received',
-                current_node TEXT,
-                data TEXT NOT NULL DEFAULT '{}',
-                error TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS pipeline_nodes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                request_id TEXT NOT NULL,
-                thread_id TEXT,
-                node_name TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                started_at TEXT,
-                finished_at TEXT,
-                duration_ms INTEGER,
-                input_snapshot TEXT,
-                output_snapshot TEXT,
-                error TEXT,
-                retry_count INTEGER DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_nodes_request
-                ON pipeline_nodes(request_id);
-
-            CREATE TABLE IF NOT EXISTS skills_generated (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                request_id TEXT NOT NULL,
-                thread_id TEXT,
-                skill_name TEXT NOT NULL,
-                skill_path TEXT,
-                source TEXT,
-                tags TEXT DEFAULT '[]',
-                use_count INTEGER DEFAULT 0,
-                quality_score REAL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-        """)
-        self._conn.commit()
+        ensure_migrated(self._conn)
 
     # =====================================================================
     # Pipeline State
     # =====================================================================
 
-    def save_pipeline_state(self, request_id: str, state: dict) -> dict:
-        """Save/update the current pipeline state."""
+    def save_state(self, request_id: str, state: dict) -> dict:
+        """Save/update the current pipeline state. Returns merged state."""
         existing = self._conn.execute(
             "SELECT data FROM pipeline_states WHERE request_id = ?",
             (request_id,),
@@ -153,33 +136,37 @@ class StateManager:
 
         return current
 
-    def get_pipeline_state(self, request_id: str) -> Optional[dict]:
-        """Get current pipeline state."""
+    def get_state(self, request_id: str) -> Optional[dict]:
+        """Get current pipeline state, or None if not found."""
         row = self._conn.execute(
             "SELECT data FROM pipeline_states WHERE request_id = ?",
             (request_id,),
         ).fetchone()
         return json.loads(row["data"]) if row else None
 
+    def save_pipeline_state(self, request_id: str, state: dict) -> dict:
+        """Alias for save_state() — preserved for backward compatibility."""
+        return self.save_state(request_id, state)
+
+    def get_pipeline_state(self, request_id: str) -> Optional[dict]:
+        """Alias for get_state() — preserved for backward compatibility."""
+        return self.get_state(request_id)
+
     # =====================================================================
     # Node Tracking
     # =====================================================================
 
     def start_node(self, request_id: str, node_name: str) -> int:
-        """Record the start of a node execution.
-
-        Returns the node record id.
-        """
+        """Record the start of a node execution. Returns the node record id."""
         with self._lock:
             cursor = self._conn.execute(
                 """INSERT INTO pipeline_nodes
                    (request_id, node_name, status, started_at)
-                   VALUES (?, ?, 'running', datetime('now'))
-                   RETURNING id""",
+                   VALUES (?, ?, 'running', datetime('now'))""",
                 (request_id, node_name),
             )
             self._conn.commit()
-            return cursor.fetchone()["id"]
+            return cursor.lastrowid
 
     def finish_node(
         self,
@@ -199,7 +186,13 @@ class StateManager:
                    error = ?,
                    duration_ms = ?
                    WHERE id = ?""",
-                (status, json.dumps(output) if output else None, error, duration_ms, node_id),
+                (
+                    status,
+                    json.dumps(output) if output else None,
+                    error,
+                    duration_ms,
+                    node_id,
+                ),
             )
             self._conn.commit()
 
@@ -216,7 +209,7 @@ class StateManager:
     # Pipeline Summary
     # =====================================================================
 
-    def get_pipeline_summary(self, request_id: str) -> dict:
+    def get_summary(self, request_id: str) -> dict:
         """Get a complete summary of a pipeline run."""
         pipeline = self._conn.execute(
             "SELECT * FROM pipeline_states WHERE request_id = ?",
@@ -231,71 +224,34 @@ class StateManager:
         ]
 
         history = self.history.get_history(request_id)
-
-        skills = self._conn.execute(
-            "SELECT * FROM skills_generated WHERE request_id = ?",
-            (request_id,),
-        ).fetchall()
-
         cost = self.history.get_cost_summary(request_id)
 
         return {
             "pipeline": dict(pipeline) if pipeline else None,
             "nodes": nodes,
             "history_turns": len(history),
-            "skills_generated": len(skills),
             "total_cost_cents": cost.get("total_cost_cents", 0),
             "total_tokens": cost.get("total_tokens", 0),
         }
 
-    # =====================================================================
-    # Skills
-    # =====================================================================
-
-    def register_skill(self, request_id: str, skill_name: str,
-                       skill_path: str, source: str, tags: List[str]) -> int:
-        """Register a skill created during a pipeline run."""
-        with self._lock:
-            cursor = self._conn.execute(
-                """INSERT INTO skills_generated
-                   (request_id, skill_name, skill_path, source, tags)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (request_id, skill_name, skill_path, source, json.dumps(tags)),
-            )
-            self._conn.commit()
-            return cursor.lastrowid
-
-    def increment_skill_use(self, skill_name: str) -> None:
-        """Increment use count when a skill is applied."""
-        with self._lock:
-            self._conn.execute(
-                "UPDATE skills_generated SET use_count = use_count + 1 WHERE skill_name = ?",
-                (skill_name,),
-            )
-            self._conn.commit()
+    def get_pipeline_summary(self, request_id: str) -> dict:
+        """Alias for get_summary() — preserved for backward compatibility."""
+        return self.get_summary(request_id)
 
     # =====================================================================
     # Recovery
     # =====================================================================
 
     def find_stalled(self, stalled_minutes: int = 5) -> List[dict]:
-        """Find stalled pipelines that may need recovery.
-
-        Uses the shared connection and queries pipeline_states directly.
-        """
+        """Find stalled pipelines that may need recovery."""
         return recovery.find_stalled_pipelines(
             stalled_minutes=stalled_minutes,
             connection=self._conn,
         )
 
     def mark_completed(self, request_id: str) -> None:
-        """Mark pipeline as completed — updates BOTH pipeline_states AND checkpoints.
-
-        For pipeline_states: saves status as 'completed'.
-        For checkpoints: merges with existing metadata (doesn't overwrite).
-        """
-        self.save_pipeline_state(request_id, {"status": "completed"})
-        # Also mark in checkpointer — uses shared connection, merges metadata
+        """Mark pipeline as completed — updates BOTH pipeline_states AND checkpoints."""
+        self.save_state(request_id, {"status": "completed"})
         thread_id = self._conn.execute(
             "SELECT thread_id FROM pipeline_states WHERE request_id = ?",
             (request_id,),
@@ -309,7 +265,7 @@ class StateManager:
 
     def mark_failed(self, request_id: str, error: str) -> None:
         """Mark pipeline as failed — updates BOTH tables."""
-        self.save_pipeline_state(request_id, {"status": "failed", "error": error})
+        self.save_state(request_id, {"status": "failed", "error": error})
         thread_id = self._conn.execute(
             "SELECT thread_id FROM pipeline_states WHERE request_id = ?",
             (request_id,),
@@ -329,35 +285,30 @@ class StateManager:
     def query(self, sql: str, params=()) -> List[dict]:
         """Run a read-only query against the state database.
 
-        Uses SQLite authorizer to BLOCK all write operations
-        (INSERT, UPDATE, DELETE, DROP, ALTER, etc.).
+        Blocks write operations by checking the SQL statement's first
+        keyword. Raises ValueError for any write attempt.
 
         Useful for custom analytics, dashboards, or debugging.
         All tables are queryable: checkpoints, agent_history,
-        pipeline_states, pipeline_nodes, skills_generated.
+        pipeline_states, pipeline_nodes.
 
         Raises:
-            sqlite3.DatabaseError: If the query attempts a write operation.
+            ValueError: If the query attempts a write operation.
         """
-        # Temporarily set read-only authorizer for this query
-        self._conn._conn.set_authorizer(_read_only_authorizer)
-        try:
-            rows = self._conn.execute(sql, params).fetchall()
-            return [dict(r) for r in rows]
-        finally:
-            # Remove authorizer after query
-            self._conn._conn.set_authorizer(None)
+        if not _is_read_only_query(sql):
+            raise ValueError(
+                f"Only read-only queries allowed. Query starts with: "
+                f"{sql.strip().split()[0].upper() if sql.strip() else '(empty)'}"
+            )
+        rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
 
     # =====================================================================
     # Maintenance
     # =====================================================================
 
     def vacuum(self) -> None:
-        """Reclaim disk space. Run periodically via cron.
-
-        With shared connection, this works because there's only
-        one connection to the database file.
-        """
+        """Reclaim disk space. Run periodically via cron."""
         with self._lock:
             self._conn.execute("VACUUM")
             self._conn.commit()

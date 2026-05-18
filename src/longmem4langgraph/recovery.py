@@ -24,7 +24,13 @@ import logging
 from datetime import datetime, timezone
 from typing import List, Optional, Any
 
-from langgraph.graph.graph import CompiledGraph
+try:
+    from langgraph.graph.state import CompiledStateGraph as CompiledGraph
+except ImportError:
+    try:
+        from langgraph.graph.graph import CompiledGraph
+    except ImportError:
+        CompiledGraph = Any
 
 from .connection import SqliteConnection
 
