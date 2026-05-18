@@ -7,6 +7,9 @@ What it stores:
     - Full graph state at each checkpoint step
     - Thread/run metadata for multi-session support
     - Timestamps for all transitions
+
+Can accept a shared SqliteConnection to avoid multiple connections
+to the same database file.
 """
 
 import json
@@ -34,18 +37,31 @@ class SqliteSaver(BaseCheckpointSaver):
         from longmem4langgraph import SqliteSaver
         graph = builder.compile(checkpointer=SqliteSaver("state.db"))
 
+    Use with a shared connection to avoid write contention:
+
+        conn = SqliteConnection("state.db")
+        saver = SqliteSaver(connection=conn)
+        history = HistoryStore(connection=conn)
+
     Args:
-        db_path: Path to SQLite file. Created automatically if it doesn't exist.
+        db_path: Path to SQLite file (only used if connection is None).
         serde: Serializer (defaults to JsonPlusSerializer).
+        connection: Optional shared SqliteConnection.
     """
 
     def __init__(
         self,
-        db_path: str,
+        db_path: str = None,
         serde: Optional[Any] = None,
+        connection: SqliteConnection = None,
     ):
         super().__init__(serde=serde or JsonPlusSerializer())
-        self._conn = SqliteConnection(db_path)
+
+        if connection:
+            self._conn = connection
+        else:
+            self._conn = SqliteConnection(db_path or "pipeline.db")
+
         self._lock = threading.Lock()
         self._init_db()
 

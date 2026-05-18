@@ -29,6 +29,16 @@ from typing import List, Optional
 from .connection import SqliteConnection
 
 
+def _validate_non_empty(value, name: str) -> None:
+    if not value or not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+
+
+def _validate_positive_int(value, name: str) -> None:
+    if value is not None and (not isinstance(value, int) or value < 1):
+        raise ValueError(f"{name} must be a positive integer, got {value}")
+
+
 class HistoryStore:
     """AGNO-style conversation memory backed by SQLite.
 
@@ -38,10 +48,14 @@ class HistoryStore:
 
     Args:
         db_path: Path to SQLite file. Can share with SqliteSaver.
+        connection: Optional shared SqliteConnection (avoids multiple connections).
     """
 
-    def __init__(self, db_path: str):
-        self._conn = SqliteConnection(db_path)
+    def __init__(self, db_path: str = None, connection: SqliteConnection = None):
+        if connection:
+            self._conn = connection
+        else:
+            self._conn = SqliteConnection(db_path or "pipeline.db")
         self._lock = threading.Lock()
         self._init_db()
 
@@ -99,34 +113,40 @@ class HistoryStore:
         Returns:
             The turn number (1-indexed).
         """
-        # Auto-increment turn number
-        turn = self._conn.execute(
-            """SELECT COALESCE(MAX(turn_number), 0) + 1
-               FROM agent_history WHERE request_id = ?""",
-            (request_id,),
-        ).fetchone()[0]
+        _validate_non_empty(request_id, "request_id")
+        _validate_non_empty(source, "source")
 
         with self._lock:
+            # Atomic: INSERT using COALESCE for auto-incrementing turn_number
+            # This avoids the race condition of SELECT-then-INSERT
             self._conn.execute(
                 """INSERT INTO agent_history
                    (request_id, thread_id, turn_number, source,
                     content_type, content, summary, metadata,
                     token_count, cost_cents)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   SELECT ?, ?, COALESCE(MAX(turn_number), 0) + 1,
+                          ?, ?, ?, ?, ?, ?, ?
+                   FROM agent_history WHERE request_id = ?""",
                 (
                     request_id,
                     thread_id,
-                    turn,
                     source,
                     content_type,
                     content,
-                    summary,
+                    summary or content[:200],
                     json.dumps(metadata or {}),
                     token_count,
                     cost_cents,
+                    request_id,
                 ),
             )
             self._conn.commit()
+
+            # Return the turn number that was just inserted
+            turn = self._conn.execute(
+                "SELECT MAX(turn_number) FROM agent_history WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()[0]
 
         return turn
 
@@ -138,9 +158,6 @@ class HistoryStore:
     ) -> List[dict]:
         """Get full conversation history as a list of dicts.
 
-        This is like AGNO's session.memory — returns every turn
-        in chronological order.
-
         Args:
             request_id: The pipeline to query.
             last_n: Only return the last N turns.
@@ -149,6 +166,9 @@ class HistoryStore:
         Returns:
             List of history entries, oldest first.
         """
+        _validate_non_empty(request_id, "request_id")
+        _validate_positive_int(last_n, "last_n")
+
         query = "SELECT * FROM agent_history WHERE request_id = ?"
         params = [request_id]
 
@@ -160,7 +180,6 @@ class HistoryStore:
         query += " ORDER BY turn_number"
 
         if last_n:
-            # Subquery to get last N turns
             query = f"""
                 SELECT * FROM (
                     SELECT * FROM agent_history WHERE request_id = ?
@@ -185,9 +204,6 @@ class HistoryStore:
     ) -> str:
         """Get history formatted as a string for LLM prompt injection.
 
-        This is the main method you'll use inside agent nodes.
-        It returns a formatted string you can inject into any prompt.
-
         Args:
             request_id: The pipeline to query.
             last_n: How many recent turns to include.
@@ -198,6 +214,9 @@ class HistoryStore:
         Returns:
             Formatted string, ready for prompt injection.
         """
+        _validate_non_empty(request_id, "request_id")
+        _validate_positive_int(last_n, "last_n")
+
         history = self.get_history(request_id, last_n=last_n)
         template = format_template or "[{source}]: {content}"
 
@@ -214,6 +233,7 @@ class HistoryStore:
 
     def count_turns(self, request_id: str) -> int:
         """Count total turns for a request."""
+        _validate_non_empty(request_id, "request_id")
         row = self._conn.execute(
             "SELECT COUNT(*) as c FROM agent_history WHERE request_id = ?",
             (request_id,),
@@ -221,13 +241,18 @@ class HistoryStore:
         return row["c"]
 
     def get_cost_summary(self, request_id: str) -> dict:
-        """Get total cost and token usage for a request."""
+        """Get total cost and token usage for a request.
+
+        Uses SUM with CASE WHEN instead of PostgreSQL FILTER (WHERE ...)
+        for cross-database compatibility (SQLite doesn't support FILTER).
+        """
+        _validate_non_empty(request_id, "request_id")
         row = self._conn.execute(
             """SELECT
                    COUNT(*) as turns,
                    COALESCE(SUM(cost_cents), 0) as total_cost_cents,
                    COALESCE(SUM(token_count), 0) as total_tokens,
-                   COUNT(*) FILTER (WHERE source LIKE 'agent%') as agent_turns
+                   SUM(CASE WHEN source LIKE 'agent%' THEN 1 ELSE 0 END) as agent_turns
                FROM agent_history WHERE request_id = ?""",
             (request_id,),
         ).fetchone()
@@ -238,11 +263,19 @@ class HistoryStore:
 
         For production, use Weaviate or other vector search.
         This is a simple LIKE-based search for quick debugging.
+
+        Note: Special LIKE characters (% and _) are escaped to prevent
+        unintended wildcard matching.
         """
+        _validate_non_empty(request_id, "request_id")
+
+        # Escape % and _ for SQLite LIKE — prevents wildcard injection
+        safe_query = query_text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
         rows = self._conn.execute(
             """SELECT * FROM agent_history
                WHERE request_id = ? AND content LIKE ?
                ORDER BY turn_number""",
-            (request_id, f"%{query_text}%"),
+            (request_id, f"%{safe_query}%"),
         ).fetchall()
         return [dict(r) for r in rows]

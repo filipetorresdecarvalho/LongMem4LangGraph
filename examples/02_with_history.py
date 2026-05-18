@@ -34,7 +34,7 @@ def build_analysis_pipeline(db_path: str):
         result = f"Agent 1 analyzed the request: '{query}'\n"
         result += f"- Found 3 key concepts\n"
         result += f"- Identified 2 related topics\n"
-        result += f- Preliminary classification: technical"
+        result += f"- Preliminary classification: technical"
 
         # Write to history — Agent 2 will read this
         history.add(rid, "agent1", result, "json")

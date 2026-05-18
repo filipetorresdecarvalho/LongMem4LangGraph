@@ -4,6 +4,9 @@ This is the 'everything in one place' class from the RTGo V5 design.
 It wraps SqliteSaver (checkpoints), HistoryStore (agent memory),
 recovery (crash recovery), and adds pipeline-level operations.
 
+All components share a single SqliteConnection to avoid write
+contention and enable VACUUM.
+
 Use this when you want a single entry point for all persistence needs.
 Use the individual components (SqliteSaver, HistoryStore) when you
 want only specific functionality.
@@ -20,6 +23,29 @@ from .saver import SqliteSaver
 from .history import HistoryStore
 from . import recovery
 
+# --- SQL Authorizer for read-only query mode ---
+_SQLITE_OK = 0
+_SQLITE_DENY = 8
+
+_SQLITE_READ = 21
+_SQLITE_INSERT = 26
+_SQLITE_UPDATE = 23
+_SQLITE_DELETE = 9
+_SQLITE_ATTACH = 27
+_SQLITE_DETACH = 28
+_SQLITE_PRAGMA = 19
+_SQLITE_FUNCTION = 31
+
+
+def _read_only_authorizer(action_code, arg1, arg2, db_name, trigger_name):
+    """SQLite authorizer that only allows SELECT and PRAGMA (non-write)."""
+    if action_code == _SQLITE_READ:
+        return _SQLITE_OK
+    if action_code == _SQLITE_PRAGMA:
+        return _SQLITE_OK
+    # Deny all write operations
+    return _SQLITE_DENY
+
 
 class StateManager:
     """Singleton-ish SQLite-backed state manager.
@@ -30,8 +56,7 @@ class StateManager:
     - Crash recovery (via recovery module)
     - Pipeline summaries, audit, and queries
 
-    While not a true Singleton (you can create instances), sharing
-    the same db_path means all components share the same SQLite file.
+    All sub-components share a single SqliteConnection.
 
     Args:
         db_path: Path to SQLite file. Use same path for all components.
@@ -41,9 +66,9 @@ class StateManager:
         self.db_path = str(Path(db_path).expanduser().resolve())
         self._conn = SqliteConnection(self.db_path)
 
-        # Sub-components sharing the same database
-        self.checkpointer = SqliteSaver(self.db_path)
-        self.history = HistoryStore(self.db_path)
+        # Sub-components sharing the SAME connection (no more 3-connection bug)
+        self.checkpointer = SqliteSaver(self.db_path, connection=self._conn)
+        self.history = HistoryStore(connection=self._conn)
 
         self._lock = threading.Lock()
         self._init_db()
@@ -254,41 +279,85 @@ class StateManager:
     # =====================================================================
 
     def find_stalled(self, stalled_minutes: int = 5) -> List[dict]:
-        """Find stalled pipelines that may need recovery."""
+        """Find stalled pipelines that may need recovery.
+
+        Uses the shared connection and queries pipeline_states directly.
+        """
         return recovery.find_stalled_pipelines(
-            self.db_path, stalled_minutes
+            stalled_minutes=stalled_minutes,
+            connection=self._conn,
         )
 
     def mark_completed(self, request_id: str) -> None:
-        """Mark pipeline as completed."""
+        """Mark pipeline as completed — updates BOTH pipeline_states AND checkpoints.
+
+        For pipeline_states: saves status as 'completed'.
+        For checkpoints: merges with existing metadata (doesn't overwrite).
+        """
         self.save_pipeline_state(request_id, {"status": "completed"})
-        # Also mark in checkpointer
+        # Also mark in checkpointer — uses shared connection, merges metadata
         thread_id = self._conn.execute(
             "SELECT thread_id FROM pipeline_states WHERE request_id = ?",
             (request_id,),
         ).fetchone()
         if thread_id and thread_id["thread_id"]:
-            recovery.mark_completed(self.db_path, thread_id["thread_id"])
+            recovery.mark_completed(
+                thread_id=thread_id["thread_id"],
+                connection=self._conn,
+                db_path=self.db_path,
+            )
+
+    def mark_failed(self, request_id: str, error: str) -> None:
+        """Mark pipeline as failed — updates BOTH tables."""
+        self.save_pipeline_state(request_id, {"status": "failed", "error": error})
+        thread_id = self._conn.execute(
+            "SELECT thread_id FROM pipeline_states WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        if thread_id and thread_id["thread_id"]:
+            recovery.mark_failed(
+                thread_id=thread_id["thread_id"],
+                error=error,
+                connection=self._conn,
+                db_path=self.db_path,
+            )
 
     # =====================================================================
-    # Query
+    # Query (read-only, SQL injection protected)
     # =====================================================================
 
     def query(self, sql: str, params=()) -> List[dict]:
-        """Run a raw query against the state database.
+        """Run a read-only query against the state database.
+
+        Uses SQLite authorizer to BLOCK all write operations
+        (INSERT, UPDATE, DELETE, DROP, ALTER, etc.).
 
         Useful for custom analytics, dashboards, or debugging.
         All tables are queryable: checkpoints, agent_history,
         pipeline_states, pipeline_nodes, skills_generated.
+
+        Raises:
+            sqlite3.DatabaseError: If the query attempts a write operation.
         """
-        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+        # Temporarily set read-only authorizer for this query
+        self._conn._conn.set_authorizer(_read_only_authorizer)
+        try:
+            rows = self._conn.execute(sql, params).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            # Remove authorizer after query
+            self._conn._conn.set_authorizer(None)
 
     # =====================================================================
     # Maintenance
     # =====================================================================
 
     def vacuum(self) -> None:
-        """Reclaim disk space. Run periodically via cron."""
+        """Reclaim disk space. Run periodically via cron.
+
+        With shared connection, this works because there's only
+        one connection to the database file.
+        """
         with self._lock:
             self._conn.execute("VACUUM")
             self._conn.commit()
@@ -298,13 +367,23 @@ class StateManager:
         self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def close(self) -> None:
-        """Graceful shutdown."""
+        """Graceful shutdown — close the shared connection."""
         self.checkpoint_wal()
         self._conn.close()
 
+    def __enter__(self) -> "StateManager":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
 
 class _NodeTracker:
-    """Context manager for automatic node tracking."""
+    """Context manager for automatic node tracking.
+
+    Uses consistent time sources (SQLite datetime('now') for storage,
+    Python datetime for duration calculation).
+    """
 
     def __init__(self, sm: StateManager, request_id: str, node_name: str):
         self._sm = sm

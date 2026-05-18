@@ -6,6 +6,7 @@ Can be shared across checkpointer, history, and recovery modules.
 
 import sqlite3
 import threading
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +16,8 @@ class SqliteConnection:
 
     Pool-free design — SQLite with WAL handles concurrent reads
     natively. Writes are serialized via a lock.
+
+    Supports context manager (with statement) for automatic cleanup.
 
     Usage:
         conn = SqliteConnection("pipeline.db")
@@ -39,6 +42,7 @@ class SqliteConnection:
         self._conn.row_factory = sqlite3.Row
 
         self._write_lock = threading.Lock()
+        self._closed = False
 
     def execute(self, sql: str, params=()) -> sqlite3.Cursor:
         """Execute a read query. Thread-safe (WAL allows concurrent reads)."""
@@ -60,11 +64,28 @@ class SqliteConnection:
 
     def close(self) -> None:
         """Graceful shutdown — flush WAL to main file before closing."""
+        if self._closed:
+            return
+        self._closed = True
         try:
             self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except Exception:
             pass
         self._conn.close()
+
+    def __del__(self) -> None:
+        """Destructor — ensures connection is closed even if close() not called."""
+        if not self._closed:
+            try:
+                self.close()
+            except Exception:
+                pass
+
+    def __enter__(self) -> "SqliteConnection":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
 
     @property
     def total_changes(self) -> int:
